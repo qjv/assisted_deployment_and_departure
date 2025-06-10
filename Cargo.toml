@@ -1,0 +1,17 @@
+[package]
+name = "assisted_departure"
+version = "0.1.0"
+edition = "2024"
+authors = ["hvaren"]
+description = "An addon that helps killing auxiliary processes when unloading it (or closing game) to avoid ghost processes. You can add Gw2-64.exe to kill itself :D"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nexus = { git = "https://github.com/zerthox/nexus-rs" }
+lazy_static = "1.4"
+sysinfo = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+ron = "0.8"
+log = "0.4"
