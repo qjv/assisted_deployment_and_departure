@@ -215,5 +215,5 @@ nexus::export! {
     load,
     unload,
     provider: UpdateProvider::GitHub,
-    update_link: "https://github.com/your/repo"
+    update_link: "https://github.com/qjv/assisted_departure"
 }
