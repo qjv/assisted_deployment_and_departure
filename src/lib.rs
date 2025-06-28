@@ -14,12 +14,14 @@ lazy_static! {
     static ref TO_KILL: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static ref INPUT: Mutex<String> = Mutex::new(String::with_capacity(64));
     static ref KILL_ON_UNLOAD: Mutex<bool> = Mutex::new(false);
+    static ref WAIT_SECONDS: Mutex<u64> = Mutex::new(2); // Default wait time: 2 seconds
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     to_kill: Vec<String>,
     kill_on_unload: bool,
+    wait_seconds: Option<u64>, // New field, optional for backward compatibility
 }
 
 fn get_config_path() -> PathBuf {
@@ -52,6 +54,7 @@ fn load() {
     let mut to_kill = TO_KILL.lock().unwrap();
     *to_kill = config.to_kill;
     *KILL_ON_UNLOAD.lock().unwrap() = config.kill_on_unload;
+    *WAIT_SECONDS.lock().unwrap() = config.wait_seconds.unwrap_or(2);
 
     // Only visible in the options tab
     register_render(RenderType::OptionsRender, render!(render_options)).revert_on_unload();
@@ -60,15 +63,22 @@ fn load() {
 fn save_current_config() {
     let to_kill = TO_KILL.lock().unwrap();
     let kill_on_unload = *KILL_ON_UNLOAD.lock().unwrap();
+    let wait_seconds = *WAIT_SECONDS.lock().unwrap();
     save_config(&Config {
         to_kill: to_kill.clone(),
         kill_on_unload,
+        wait_seconds: Some(wait_seconds),
     });
 }
 
 fn unload() {
     save_current_config();
     if *KILL_ON_UNLOAD.lock().unwrap() {
+        let wait = *WAIT_SECONDS.lock().unwrap();
+        if wait > 0 {
+            log::info!("Waiting {} seconds for processes to terminate...", wait);
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+        }
         cleanup_processes(); // Synchronous, no thread
     }
     TO_KILL.lock().unwrap().clear();
@@ -163,6 +173,7 @@ fn render_options(ui: &Ui) {
         save_config(&Config {
             to_kill: to_kill.clone(),
             kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
+            wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
         });
     }
 
@@ -176,6 +187,7 @@ fn render_options(ui: &Ui) {
             save_config(&Config {
                 to_kill: to_kill.clone(),
                 kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
+                wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
             });
             input.clear();
         }
@@ -188,6 +200,7 @@ fn render_options(ui: &Ui) {
             save_config(&Config {
                 to_kill: to_kill.clone(),
                 kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
+                wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
             });
             input.clear();
         }
@@ -205,6 +218,21 @@ fn render_options(ui: &Ui) {
     if ui.checkbox("Kill on unload (may cause stutter/crash!)", &mut kill_on_unload) {
         *KILL_ON_UNLOAD.lock().unwrap() = kill_on_unload;
         save_current_config();
+    }
+
+    // Add textbox for wait time
+    let mut wait_seconds_str = WAIT_SECONDS.lock().unwrap().to_string();
+    ui.text("Wait time after kill (seconds):");
+    ui.same_line();
+    ui.set_next_item_width(40.0); // Set width for the next item only
+    if InputText::new(ui, "##wait_time", &mut wait_seconds_str)
+        .chars_decimal(true)
+        .build()
+    {
+        if let Ok(val) = wait_seconds_str.parse::<u64>() {
+            *WAIT_SECONDS.lock().unwrap() = val;
+            save_current_config();
+        }
     }
 }
 
