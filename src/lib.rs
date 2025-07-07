@@ -3,7 +3,7 @@ use nexus::{
     AddonFlags, UpdateProvider,
     gui::{RenderType, register_render, render},
     imgui::{InputText, TreeNodeFlags, Ui, Window},
-    keybind::register_keybind_with_string,
+    keybind::{register_keybind_with_string, unregister_keybind},
     log::{self, LogLevel},
     paths::get_addon_dir,
 };
@@ -44,8 +44,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             programs_to_launch: Vec::new(),
-            // Default to killing the game process itself, can be removed by user
-            programs_to_kill: vec!["Gw2-64.exe".to_string()],
+            // The kill list is now empty by default.
+            programs_to_kill: Vec::new(),
             wait_seconds: 2,
         }
     }
@@ -79,14 +79,27 @@ fn is_process_running(process_name: &str) -> bool {
         .any(|p| p.name().to_lowercase() == lower_process_name)
 }
 
-/// Launches a process directly without any checks.
+/// Launches a process directly without any checks, setting its working directory.
 fn force_launch_process(path: &str) {
     log::log(
         LogLevel::Info,
         "SYSTEM",
         &format!("Attempting to launch: {}", path),
     );
-    if let Err(e) = Command::new(path).spawn() {
+
+    let mut command = Command::new(path);
+
+    // Set the working directory to the parent folder of the executable
+    if let Some(parent_dir) = Path::new(path).parent() {
+        command.current_dir(parent_dir);
+        log::log(
+            LogLevel::Info,
+            "SYSTEM",
+            &format!("Setting working directory to: {:?}", parent_dir),
+        );
+    }
+
+    if let Err(e) = command.spawn() {
         log::log(
             LogLevel::Critical,
             "SYSTEM",
@@ -189,6 +202,7 @@ fn load() {
         "Loading Assisted Deployment and Departure...",
     );
 
+    // Initial setup on load
     for program in config.programs_to_launch.iter() {
         match program.trigger {
             LaunchTrigger::OnAddonLoad => {
@@ -196,17 +210,7 @@ fn load() {
             }
             LaunchTrigger::OnKeybind => {
                 let identifier = format!("LAUNCH_{}", program.name);
-                // Register the keybind identifier without a default key.
-                // The user will assign the key in the Nexus options.
-                register_keybind_with_string(identifier, keybind_callback, "").revert_on_unload();
-                log::log(
-                    LogLevel::Info,
-                    "SYSTEM",
-                    &format!(
-                        "Registered keybind action for '{}'. Please assign a key in Nexus options.",
-                        program.name
-                    ),
-                );
+                register_keybind_with_string(identifier, keybind_callback, "");
             }
         }
     }
@@ -217,6 +221,10 @@ fn load() {
 fn unload() {
     save_config_to_file();
     let config = CONFIG.lock().unwrap().clone();
+
+    // Keybinds are no longer unregistered on unload to allow them to persist.
+    // They are now only unregistered in the UI when the user explicitly removes
+    // a program or changes its trigger.
 
     // Collect all processes that need to be terminated.
     let mut kill_list = config.programs_to_kill;
@@ -260,56 +268,52 @@ fn cleanup_processes(targets: &[String]) {
     let mut sys = System::new_all();
     sys.refresh_processes();
 
-    // Safely get the current process ID to avoid a panic.
-    let current_pid = match sysinfo::get_current_pid() {
-        Ok(pid) => pid,
-        Err(e) => {
-            log::log(
-                LogLevel::Critical,
-                "SYSTEM",
-                &format!(
-                    "Could not get current process PID: {}. The host process cannot be killed.",
-                    e
-                ),
-            );
-            return; // Exit the function if we can't get our own PID.
-        }
-    };
+    let current_pid_res = sysinfo::get_current_pid();
 
-    let mut kill_self = false;
+    for target_name in targets {
+        // Find all running processes that match the target name.
+        // This check ensures we only try to kill processes that are actually alive.
+        let processes_to_kill: Vec<_> = sys
+            .processes()
+            .values()
+            .filter(|p| p.name().eq_ignore_ascii_case(target_name))
+            .collect();
 
-    for process in sys.processes().values() {
-        let name_lower = process.name().to_lowercase();
-        if targets.iter().any(|t| name_lower == t.to_lowercase()) {
-            if process.pid() == current_pid {
-                kill_self = true;
-            } else {
-                log::log(
-                    LogLevel::Info,
-                    "SYSTEM",
-                    &format!(
-                        "Killing process: {} (PID: {})",
-                        process.name(),
-                        process.pid()
-                    ),
-                );
-                process.kill_with(Signal::Kill);
+        for process in processes_to_kill {
+            // Ensure we don't kill the host process (the game) until the very end.
+            if let Ok(current_pid) = current_pid_res {
+                if process.pid() == current_pid {
+                    continue; // Skip killing self for now.
+                }
             }
-        }
-    }
-
-    if kill_self {
-        if let Some(proc) = sys.process(current_pid) {
             log::log(
                 LogLevel::Info,
                 "SYSTEM",
                 &format!(
-                    "Killing own process last: {} (PID: {})",
-                    proc.name(),
-                    current_pid
+                    "Killing process: {} (PID: {})",
+                    process.name(),
+                    process.pid()
                 ),
             );
-            proc.kill_with(Signal::Kill);
+            process.kill_with(Signal::Kill);
+        }
+    }
+
+    // Finally, if Gw2-64.exe was in the kill list, terminate it now.
+    if let Ok(current_pid) = current_pid_res {
+        if targets.iter().any(|t| t.eq_ignore_ascii_case("Gw2-64.exe")) {
+            if let Some(proc) = sys.process(current_pid) {
+                log::log(
+                    LogLevel::Info,
+                    "SYSTEM",
+                    &format!(
+                        "Killing own process last: {} (PID: {})",
+                        proc.name(),
+                        current_pid
+                    ),
+                );
+                proc.kill_with(Signal::Kill);
+            }
         }
     }
 }
@@ -353,14 +357,11 @@ fn render_options(ui: &Ui) {
     if close_popup {
         *pending_launch = None;
     }
-
-    // Must drop the lock before the main config lock is taken
     drop(pending_launch);
 
     // --- Main UI ---
     let mut config = CONFIG.lock().unwrap();
     let mut config_changed = false;
-    let mut needs_reload = false;
 
     ui.text("Manage external programs to launch with the game or kill on exit.");
     ui.separator();
@@ -372,32 +373,56 @@ fn render_options(ui: &Ui) {
             ui.text(&prog.path);
             ui.same_line();
             if ui.small_button(&format!("-##launch{}", i)) {
+                if prog.trigger == LaunchTrigger::OnKeybind {
+                    unregister_keybind(&format!("LAUNCH_{}", prog.name));
+                }
                 to_remove = Some(i);
                 config_changed = true;
-                needs_reload = true; // Reload to unregister the keybind
             }
 
-            // Trigger options
+            // --- Corrected Radio Button Logic ---
+            let original_trigger = prog.trigger.clone();
+
+            // Create unique labels for the radio buttons using the item index `i`.
             if ui.radio_button_bool(
-                "Load on Addon Start",
+                &format!("Load on Addon Start##{}", i),
                 prog.trigger == LaunchTrigger::OnAddonLoad,
             ) {
                 prog.trigger = LaunchTrigger::OnAddonLoad;
-                config_changed = true;
-                needs_reload = true;
             }
             ui.same_line();
-            if ui.radio_button_bool("Load on Keybind", prog.trigger == LaunchTrigger::OnKeybind) {
+            if ui.radio_button_bool(
+                &format!("Load on Keybind##{}", i),
+                prog.trigger == LaunchTrigger::OnKeybind,
+            ) {
                 prog.trigger = LaunchTrigger::OnKeybind;
-                config_changed = true;
-                needs_reload = true;
             }
 
+            // If the state changed, handle the side-effects
+            if original_trigger != prog.trigger {
+                config_changed = true;
+                match original_trigger {
+                    LaunchTrigger::OnKeybind => {
+                        // It was a keybind, now it's not. Unregister it.
+                        unregister_keybind(&format!("LAUNCH_{}", prog.name));
+                    }
+                    _ => {} // No action needed if it was OnAddonLoad
+                }
+                match prog.trigger {
+                    LaunchTrigger::OnKeybind => {
+                        // It's a keybind now. Register it.
+                        let identifier = format!("LAUNCH_{}", prog.name);
+                        register_keybind_with_string(identifier, keybind_callback, "");
+                    }
+                    _ => {} // No action needed if it's now OnAddonLoad
+                }
+            }
+            // --- End Corrected Logic ---
+
             if prog.trigger == LaunchTrigger::OnKeybind {
-                ui.text(format!("Keybind Identifier: LAUNCH_{}", prog.name));
                 ui.text_colored(
                     [0.6, 0.6, 0.6, 1.0],
-                    "Set the key in Nexus Options -> Keybinds",
+                    format!("Keybind Identifier: LAUNCH_{}", prog.name),
                 );
             }
 
@@ -424,7 +449,6 @@ fn render_options(ui: &Ui) {
                 if !launch_input.is_empty() {
                     let path = launch_input.clone();
                     if let Some(name) = get_filename_from_path(&path) {
-                        // Check for duplicate names
                         if !config.programs_to_launch.iter().any(|p| p.name == name) {
                             config.programs_to_launch.push(ProgramToLaunch {
                                 name,
@@ -433,7 +457,6 @@ fn render_options(ui: &Ui) {
                                 close_on_unload: false,
                             });
                             config_changed = true;
-                            needs_reload = true;
                         } else {
                             log::log(
                                 LogLevel::Warning,
@@ -472,7 +495,6 @@ fn render_options(ui: &Ui) {
             ui.same_line();
             if ui.button("+##add_kill_btn") {
                 if !kill_input.is_empty() {
-                    // Prevent adding duplicates
                     if !config.programs_to_kill.contains(&*kill_input) {
                         config.programs_to_kill.push(kill_input.clone());
                         config_changed = true;
@@ -502,13 +524,6 @@ fn render_options(ui: &Ui) {
         }
     }
 
-    if needs_reload {
-        ui.text_colored(
-            [1.0, 1.0, 0.0, 1.0],
-            "Note: A restart of the addon (or game) is required for changes to take effect.",
-        );
-    }
-
     if config_changed {
         drop(config);
         save_config_to_file();
@@ -522,5 +537,5 @@ nexus::export! {
     load,
     unload,
     provider: UpdateProvider::GitHub,
-    update_link: "https://github.com/qjv/assisted_departure"
+    update_link: "https://github.com/qjv/assisted_deployment_and_departure"
 }
