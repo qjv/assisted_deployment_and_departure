@@ -1,244 +1,523 @@
-use nexus::{
-    gui::{register_render, render, RenderType},
-    imgui::{Ui, InputText},
-    paths::get_addon_dir,
-    AddonFlags, UpdateProvider,
-};
 use lazy_static::lazy_static;
-use std::sync::Mutex;
-use sysinfo::{System, SystemExt, Signal, ProcessExt};
-use serde::{Serialize, Deserialize};
-use std::{fs, path::PathBuf};
+use nexus::{
+    AddonFlags, UpdateProvider,
+    gui::{RenderType, register_render, render},
+    imgui::{InputText, TreeNodeFlags, Ui, Window},
+    keybind::register_keybind_with_string,
+    log::{self, LogLevel},
+    paths::get_addon_dir,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    ffi::{CStr, c_char},
+    fs, panic,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+};
+use sysinfo::{ProcessExt, Signal, System, SystemExt};
 
-lazy_static! {
-    static ref TO_KILL: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static ref INPUT: Mutex<String> = Mutex::new(String::with_capacity(64));
-    static ref KILL_ON_UNLOAD: Mutex<bool> = Mutex::new(false);
-    static ref WAIT_SECONDS: Mutex<u64> = Mutex::new(2); // Default wait time: 2 seconds
+// --- Configuration & State Management ---
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+enum LaunchTrigger {
+    OnAddonLoad,
+    OnKeybind,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Clone)]
+struct ProgramToLaunch {
+    name: String,
+    path: String,
+    trigger: LaunchTrigger,
+    close_on_unload: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 struct Config {
-    to_kill: Vec<String>,
-    kill_on_unload: bool,
-    wait_seconds: Option<u64>, // New field, optional for backward compatibility
+    programs_to_launch: Vec<ProgramToLaunch>,
+    programs_to_kill: Vec<String>,
+    wait_seconds: u64,
 }
 
-fn get_config_path() -> PathBuf {
-    get_addon_dir(env!("CARGO_PKG_NAME"))
-        .expect("Addon dir should exist")
-        .join("settings.ron")
-}
-
-fn load_config() -> Config {
-    let path = get_config_path();
-    if let Ok(content) = fs::read_to_string(&path) {
-        ron::from_str(&content).unwrap_or_default()
-    } else {
-        Config::default()
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            programs_to_launch: Vec::new(),
+            // Default to killing the game process itself, can be removed by user
+            programs_to_kill: vec!["Gw2-64.exe".to_string()],
+            wait_seconds: 2,
+        }
     }
 }
 
-fn save_config(config: &Config) {
+lazy_static! {
+    static ref CONFIG: Mutex<Config> = Mutex::new(Config::default());
+    // Transient UI state for input boxes
+    static ref LAUNCH_INPUT: Mutex<String> = Mutex::new(String::with_capacity(260));
+    static ref KILL_INPUT: Mutex<String> = Mutex::new(String::with_capacity(64));
+    // State for handling launch confirmation popup
+    static ref PENDING_LAUNCH_CONFIRMATION: Mutex<Option<String>> = Mutex::new(None);
+}
+
+// --- Helper Functions ---
+
+fn get_filename_from_path(path_str: &str) -> Option<String> {
+    Path::new(path_str)
+        .file_name()
+        .and_then(|os_str| os_str.to_str())
+        .map(|s| s.to_string())
+}
+
+/// Checks if a process with the given name is currently running.
+fn is_process_running(process_name: &str) -> bool {
+    let mut sys = System::new_all();
+    sys.refresh_processes();
+    let lower_process_name = process_name.to_lowercase();
+    sys.processes()
+        .values()
+        .any(|p| p.name().to_lowercase() == lower_process_name)
+}
+
+/// Launches a process directly without any checks.
+fn force_launch_process(path: &str) {
+    log::log(
+        LogLevel::Info,
+        "SYSTEM",
+        &format!("Attempting to launch: {}", path),
+    );
+    if let Err(e) = Command::new(path).spawn() {
+        log::log(
+            LogLevel::Critical,
+            "SYSTEM",
+            &format!("Failed to launch process '{}': {}", path, e),
+        );
+    }
+}
+
+/// Checks if a process is running and launches it, asking for confirmation if needed.
+fn launch_process(path: &str) {
+    if let Some(filename) = get_filename_from_path(path) {
+        if is_process_running(&filename) {
+            // Set state to trigger UI popup
+            let mut pending = PENDING_LAUNCH_CONFIRMATION.lock().unwrap();
+            *pending = Some(path.to_string());
+        } else {
+            force_launch_process(path);
+        }
+    } else {
+        // If we can't get a filename, just try to launch it.
+        force_launch_process(path);
+    }
+}
+
+fn launch_process_by_name(name: &str) {
+    let config = CONFIG.lock().unwrap();
+    if let Some(program) = config.programs_to_launch.iter().find(|p| p.name == name) {
+        launch_process(&program.path);
+    } else {
+        log::log(
+            LogLevel::Critical,
+            "SYSTEM",
+            &format!("Program with name '{}' not found for keybind.", name),
+        );
+    }
+}
+
+// --- Keybind Handler ---
+
+extern "C-unwind" fn keybind_callback(identifier: *const c_char, is_release: bool) {
+    if is_release || identifier.is_null() {
+        return;
+    }
+
+    let result = panic::catch_unwind(|| {
+        let identifier_cstr = unsafe { CStr::from_ptr(identifier) };
+        if let Ok(id_str) = identifier_cstr.to_str() {
+            if let Some(name) = id_str.strip_prefix("LAUNCH_") {
+                launch_process_by_name(name);
+            }
+        }
+    });
+
+    if result.is_err() {
+        log::log(
+            LogLevel::Critical,
+            "SYSTEM",
+            "Panic caught in keybind handler!",
+        );
+    }
+}
+
+// --- Configuration Persistence ---
+
+fn get_config_path() -> PathBuf {
+    get_addon_dir(env!("CARGO_PKG_NAME"))
+        .expect("Addon directory should exist")
+        .join("settings.ron")
+}
+
+fn load_config_from_file() {
+    let path = get_config_path();
+    let loaded_config = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| ron::from_str(&content).ok())
+        .unwrap_or_default();
+    *CONFIG.lock().unwrap() = loaded_config;
+}
+
+fn save_config_to_file() {
     let path = get_config_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(serialized) = ron::to_string(config) {
+    let config = CONFIG.lock().unwrap();
+    if let Ok(serialized) = ron::to_string(&*config) {
         let _ = fs::write(path, serialized);
     }
 }
 
-fn load() {
-    let config = load_config();
-    let mut to_kill = TO_KILL.lock().unwrap();
-    *to_kill = config.to_kill;
-    *KILL_ON_UNLOAD.lock().unwrap() = config.kill_on_unload;
-    *WAIT_SECONDS.lock().unwrap() = config.wait_seconds.unwrap_or(2);
+// --- Core Logic & Lifecycle ---
 
-    // Only visible in the options tab
+fn load() {
+    load_config_from_file();
+
+    let config = CONFIG.lock().unwrap();
+    log::log(
+        LogLevel::Info,
+        "SYSTEM",
+        "Loading Assisted Deployment and Departure...",
+    );
+
+    for program in config.programs_to_launch.iter() {
+        match program.trigger {
+            LaunchTrigger::OnAddonLoad => {
+                launch_process(&program.path);
+            }
+            LaunchTrigger::OnKeybind => {
+                let identifier = format!("LAUNCH_{}", program.name);
+                // Register the keybind identifier without a default key.
+                // The user will assign the key in the Nexus options.
+                register_keybind_with_string(identifier, keybind_callback, "").revert_on_unload();
+                log::log(
+                    LogLevel::Info,
+                    "SYSTEM",
+                    &format!(
+                        "Registered keybind action for '{}'. Please assign a key in Nexus options.",
+                        program.name
+                    ),
+                );
+            }
+        }
+    }
+
     register_render(RenderType::OptionsRender, render!(render_options)).revert_on_unload();
 }
 
-fn save_current_config() {
-    let to_kill = TO_KILL.lock().unwrap();
-    let kill_on_unload = *KILL_ON_UNLOAD.lock().unwrap();
-    let wait_seconds = *WAIT_SECONDS.lock().unwrap();
-    save_config(&Config {
-        to_kill: to_kill.clone(),
-        kill_on_unload,
-        wait_seconds: Some(wait_seconds),
-    });
-}
-
 fn unload() {
-    save_current_config();
-    if *KILL_ON_UNLOAD.lock().unwrap() {
-        let wait = *WAIT_SECONDS.lock().unwrap();
-        if wait > 0 {
-            log::info!("Waiting {} seconds for processes to terminate...", wait);
-            std::thread::sleep(std::time::Duration::from_secs(wait));
+    save_config_to_file();
+    let config = CONFIG.lock().unwrap().clone();
+
+    // Collect all processes that need to be terminated.
+    let mut kill_list = config.programs_to_kill;
+    for program in config.programs_to_launch.iter() {
+        if program.close_on_unload {
+            if let Some(filename) = get_filename_from_path(&program.path) {
+                if !kill_list.contains(&filename) {
+                    kill_list.push(filename);
+                }
+            }
         }
-        cleanup_processes(); // Synchronous, no thread
     }
-    TO_KILL.lock().unwrap().clear();
+
+    if !kill_list.is_empty() {
+        if config.wait_seconds > 0 {
+            log::log(
+                LogLevel::Info,
+                "SYSTEM",
+                &format!(
+                    "Waiting {} seconds before process cleanup...",
+                    config.wait_seconds
+                ),
+            );
+            std::thread::sleep(std::time::Duration::from_secs(config.wait_seconds));
+        }
+        cleanup_processes(&kill_list);
+    }
+    log::log(
+        LogLevel::Info,
+        "SYSTEM",
+        "Unloaded Assisted Deployment and Departure.",
+    );
 }
 
-fn cleanup_processes() {
-    log::info!("Starting cleanup_processes");
+fn cleanup_processes(targets: &[String]) {
+    log::log(
+        LogLevel::Info,
+        "SYSTEM",
+        &format!("Starting process cleanup for targets: {:?}", targets),
+    );
     let mut sys = System::new_all();
     sys.refresh_processes();
 
-    let targets = TO_KILL.lock().unwrap().clone();
-    log::info!("Targets: {:?}", targets);
-
-    let current_pid = sysinfo::get_current_pid().unwrap();
-    let mut kill_self = false;
-
-    // First, kill all matching processes except self
-    for proc in sys.processes().values() {
-        let name = proc.name().to_lowercase();
-        let pid = proc.pid();
-
-        if targets.iter().any(|t| name == t.to_lowercase()) {
-            if pid == current_pid {
-                kill_self = true;
-                continue;
-            }
-            log::info!("Killing process: {} (PID: {})", proc.name(), pid);
-            let _ = proc.kill_with(Signal::Kill);
+    // Safely get the current process ID to avoid a panic.
+    let current_pid = match sysinfo::get_current_pid() {
+        Ok(pid) => pid,
+        Err(e) => {
+            log::log(
+                LogLevel::Critical,
+                "SYSTEM",
+                &format!(
+                    "Could not get current process PID: {}. The host process cannot be killed.",
+                    e
+                ),
+            );
+            return; // Exit the function if we can't get our own PID.
         }
-    }
-
-    // Now, if self is in the kill list, kill self last
-    if kill_self {
-        if let Some(proc) = sys.process(current_pid) {
-            log::info!("Killing own process last: {} (PID: {})", proc.name(), current_pid);
-            let _ = proc.kill_with(Signal::Kill);
-        }
-    }
-
-    log::info!("Finished cleanup_processes");
-}
-
-fn render_options(ui: &Ui) {
-    ui.text("Processes to kill on unload:");
-
-    // Step 1: Collect a snapshot for display
-    let to_kill_snapshot = {
-        let to_kill = TO_KILL.lock().unwrap();
-        to_kill.clone()
     };
 
-    let mut action = None; // (action_type, index)
+    let mut kill_self = false;
 
-    for (i, name) in to_kill_snapshot.iter().enumerate() {
-        ui.text(format!("• {}", name));
-
-        if i > 0 {
-            ui.same_line();
-            if ui.small_button(&format!("Up##{}", i)) {
-                action = Some(("up", i));
+    for process in sys.processes().values() {
+        let name_lower = process.name().to_lowercase();
+        if targets.iter().any(|t| name_lower == t.to_lowercase()) {
+            if process.pid() == current_pid {
+                kill_self = true;
+            } else {
+                log::log(
+                    LogLevel::Info,
+                    "SYSTEM",
+                    &format!(
+                        "Killing process: {} (PID: {})",
+                        process.name(),
+                        process.pid()
+                    ),
+                );
+                process.kill_with(Signal::Kill);
             }
-        }
-
-        if i + 1 < to_kill_snapshot.len() {
-            ui.same_line();
-            if ui.small_button(&format!("Down##{}", i)) {
-                action = Some(("down", i));
-            }
-        }
-
-        ui.same_line();
-        if ui.small_button(&format!("Remove##{}", i)) {
-            action = Some(("remove", i));
         }
     }
 
-    // Step 2: Apply the action after the loop
-    if let Some((act, i)) = action {
-        let mut to_kill = TO_KILL.lock().unwrap();
-        match act {
-            "up" if i > 0 => {
-                to_kill.swap(i, i - 1);
-            }
-            "down" if i + 1 < to_kill.len() => {
-                to_kill.swap(i, i + 1);
-            }
-            "remove" if i < to_kill.len() => {
-                to_kill.remove(i);
-            }
-            _ => {}
+    if kill_self {
+        if let Some(proc) = sys.process(current_pid) {
+            log::log(
+                LogLevel::Info,
+                "SYSTEM",
+                &format!(
+                    "Killing own process last: {} (PID: {})",
+                    proc.name(),
+                    current_pid
+                ),
+            );
+            proc.kill_with(Signal::Kill);
         }
-        save_config(&Config {
-            to_kill: to_kill.clone(),
-            kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
-            wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
+    }
+}
+
+// --- UI Rendering ---
+
+fn render_options(ui: &Ui) {
+    // --- Popup Window Handling ---
+    let mut pending_launch = PENDING_LAUNCH_CONFIRMATION.lock().unwrap();
+    let mut close_popup = false;
+
+    if let Some(path_to_launch) = pending_launch.as_ref() {
+        let filename =
+            get_filename_from_path(path_to_launch).unwrap_or_else(|| "program".to_string());
+        let mut window_is_open = true;
+
+        Window::new(&format!("'{}' Already Running", filename))
+            .opened(&mut window_is_open)
+            .always_auto_resize(true)
+            .collapsible(false)
+            .build(ui, || {
+                ui.text("This program is already running.");
+                ui.text("Do you want to open another instance?");
+                ui.separator();
+
+                if ui.button("Yes") {
+                    force_launch_process(path_to_launch);
+                    close_popup = true;
+                }
+                ui.same_line();
+                if ui.button("No") {
+                    close_popup = true;
+                }
+            });
+
+        if !window_is_open {
+            close_popup = true;
+        }
+    }
+
+    if close_popup {
+        *pending_launch = None;
+    }
+
+    // Must drop the lock before the main config lock is taken
+    drop(pending_launch);
+
+    // --- Main UI ---
+    let mut config = CONFIG.lock().unwrap();
+    let mut config_changed = false;
+    let mut needs_reload = false;
+
+    ui.text("Manage external programs to launch with the game or kill on exit.");
+    ui.separator();
+
+    // --- Section: Programs to Launch ---
+    if ui.collapsing_header("Programs to Launch", TreeNodeFlags::DEFAULT_OPEN) {
+        let mut to_remove = None;
+        for (i, prog) in config.programs_to_launch.iter_mut().enumerate() {
+            ui.text(&prog.path);
+            ui.same_line();
+            if ui.small_button(&format!("-##launch{}", i)) {
+                to_remove = Some(i);
+                config_changed = true;
+                needs_reload = true; // Reload to unregister the keybind
+            }
+
+            // Trigger options
+            if ui.radio_button_bool(
+                "Load on Addon Start",
+                prog.trigger == LaunchTrigger::OnAddonLoad,
+            ) {
+                prog.trigger = LaunchTrigger::OnAddonLoad;
+                config_changed = true;
+                needs_reload = true;
+            }
+            ui.same_line();
+            if ui.radio_button_bool("Load on Keybind", prog.trigger == LaunchTrigger::OnKeybind) {
+                prog.trigger = LaunchTrigger::OnKeybind;
+                config_changed = true;
+                needs_reload = true;
+            }
+
+            if prog.trigger == LaunchTrigger::OnKeybind {
+                ui.text(format!("Keybind Identifier: LAUNCH_{}", prog.name));
+                ui.text_colored(
+                    [0.6, 0.6, 0.6, 1.0],
+                    "Set the key in Nexus Options -> Keybinds",
+                );
+            }
+
+            if ui.checkbox(
+                &format!("Close when unloading##{}", i),
+                &mut prog.close_on_unload,
+            ) {
+                config_changed = true;
+            }
+            ui.separator();
+        }
+
+        if let Some(i) = to_remove {
+            config.programs_to_launch.remove(i);
+        }
+
+        ui.text("Add new program (full path):");
+        let mut launch_input = LAUNCH_INPUT.lock().unwrap();
+        ui.group(|| {
+            ui.set_next_item_width(300.0);
+            InputText::new(ui, "##add_launch", &mut *launch_input).build();
+            ui.same_line();
+            if ui.button("+##add_launch_btn") {
+                if !launch_input.is_empty() {
+                    let path = launch_input.clone();
+                    if let Some(name) = get_filename_from_path(&path) {
+                        // Check for duplicate names
+                        if !config.programs_to_launch.iter().any(|p| p.name == name) {
+                            config.programs_to_launch.push(ProgramToLaunch {
+                                name,
+                                path,
+                                trigger: LaunchTrigger::OnAddonLoad,
+                                close_on_unload: false,
+                            });
+                            config_changed = true;
+                            needs_reload = true;
+                        } else {
+                            log::log(
+                                LogLevel::Warning,
+                                "SYSTEM",
+                                &format!("A program named '{}' already exists.", name),
+                            );
+                        }
+                    }
+                    launch_input.clear();
+                }
+            }
+        });
+    }
+
+    // --- Section: Programs to Kill ---
+    if ui.collapsing_header("Programs to Kill on Unload", TreeNodeFlags::empty()) {
+        let mut to_remove = None;
+        for (i, name) in config.programs_to_kill.iter().enumerate() {
+            ui.text(name);
+            ui.same_line();
+            if ui.small_button(&format!("-##kill{}", i)) {
+                to_remove = Some(i);
+                config_changed = true;
+            }
+        }
+
+        if let Some(i) = to_remove {
+            config.programs_to_kill.remove(i);
+        }
+
+        ui.text("Add process name to kill list:");
+        let mut kill_input = KILL_INPUT.lock().unwrap();
+        ui.group(|| {
+            ui.set_next_item_width(300.0);
+            InputText::new(ui, "##add_kill", &mut *kill_input).build();
+            ui.same_line();
+            if ui.button("+##add_kill_btn") {
+                if !kill_input.is_empty() {
+                    // Prevent adding duplicates
+                    if !config.programs_to_kill.contains(&*kill_input) {
+                        config.programs_to_kill.push(kill_input.clone());
+                        config_changed = true;
+                    }
+                    kill_input.clear();
+                }
+            }
         });
     }
 
     ui.separator();
 
-    let mut input = INPUT.lock().unwrap();
-    if InputText::new(ui, "Add process name", &mut *input).enter_returns_true(true).build() {
-        if !input.is_empty() {
-            let mut to_kill = TO_KILL.lock().unwrap();
-            to_kill.push(input.to_string());
-            save_config(&Config {
-                to_kill: to_kill.clone(),
-                kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
-                wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
-            });
-            input.clear();
-        }
-    }
-
-    if ui.button("Add to list") {
-        if !input.is_empty() {
-            let mut to_kill = TO_KILL.lock().unwrap();
-            to_kill.push(input.to_string());
-            save_config(&Config {
-                to_kill: to_kill.clone(),
-                kill_on_unload: *KILL_ON_UNLOAD.lock().unwrap(),
-                wait_seconds: Some(*WAIT_SECONDS.lock().unwrap()),
-            });
-            input.clear();
-        }
-    }
-
-    ui.separator();
-    if ui.button("Kill All Processes Now") {
-        std::thread::spawn(|| {
-            cleanup_processes();
-        });
-    }
-
-    // Add the checkbox for "Kill on unload"
-    let mut kill_on_unload = *KILL_ON_UNLOAD.lock().unwrap();
-    if ui.checkbox("Kill on unload (may cause stutter/crash!)", &mut kill_on_unload) {
-        *KILL_ON_UNLOAD.lock().unwrap() = kill_on_unload;
-        save_current_config();
-    }
-
-    // Add textbox for wait time
-    let mut wait_seconds_str = WAIT_SECONDS.lock().unwrap().to_string();
-    ui.text("Wait time after kill (seconds):");
+    // --- Section: Global Settings ---
+    ui.text("Wait time before cleanup (seconds):");
     ui.same_line();
-    ui.set_next_item_width(40.0); // Set width for the next item only
-    if InputText::new(ui, "##wait_time", &mut wait_seconds_str)
+    ui.set_next_item_width(40.0);
+    let mut wait_str = config.wait_seconds.to_string();
+    if InputText::new(ui, "##wait_time", &mut wait_str)
         .chars_decimal(true)
         .build()
     {
-        if let Ok(val) = wait_seconds_str.parse::<u64>() {
-            *WAIT_SECONDS.lock().unwrap() = val;
-            save_current_config();
+        if let Ok(val) = wait_str.parse::<u64>() {
+            if config.wait_seconds != val {
+                config.wait_seconds = val;
+                config_changed = true;
+            }
         }
+    }
+
+    if needs_reload {
+        ui.text_colored(
+            [1.0, 1.0, 0.0, 1.0],
+            "Note: A restart of the addon (or game) is required for changes to take effect.",
+        );
+    }
+
+    if config_changed {
+        drop(config);
+        save_config_to_file();
     }
 }
 
 nexus::export! {
-    name: "Process Retirement House and Assisted Departure",
-    signature: -128174,
+    name: "Assisted Deployment and Departure",
+    signature: -128175, // Incremented signature for the new version
     flags: AddonFlags::None,
     load,
     unload,

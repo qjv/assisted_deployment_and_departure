@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "assisted_departure"
-version = "0.1.1"
+name = "assisted_deployment_and_departure"
+version = "0.2.0"
 dependencies = [
  "lazy_static",
  "log",

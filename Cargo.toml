@@ -1,9 +1,9 @@
 [package]
-name = "assisted_departure"
-version = "0.1.1"
-edition = "2024"
+name = "assisted_deployment_and_departure"
+version = "0.2.0"
+edition = "2021"
 authors = ["hvaren"]
-description = "An addon that helps killing auxiliary processes when unloading it (or closing game) to avoid ghost processes. You can add Gw2-64.exe to kill itself :D"
+description = "An addon to launch programs when the game starts and kill processes when it closes."
 
 [lib]
 crate-type = ["cdylib"]
