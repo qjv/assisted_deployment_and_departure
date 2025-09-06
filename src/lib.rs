@@ -6,7 +6,7 @@ use nexus::{
     log::{self, LogLevel},
     paths::get_addon_dir,
     quick_access::{add_quick_access, remove_quick_access},
-    texture::load_texture_from_file,
+    texture::get_texture_or_create_from_file, // MODIFIED: Use the correct function
     AddonFlags, UpdateProvider,
 };
 use rfd::FileDialog;
@@ -31,8 +31,8 @@ enum LaunchTrigger { OnAddonLoad, OnKeybind }
 #[derive(Serialize, Deserialize, Clone)]
 struct ProgramToLaunch { name: String, path: String, trigger: LaunchTrigger, close_on_unload: bool }
 #[derive(Serialize, Deserialize, Clone)]
-struct Config { programs_to_launch: Vec<ProgramToLaunch>, programs_to_kill: Vec<String>, wait_seconds: u64 }
-impl Default for Config { fn default() -> Self { Self { programs_to_launch: Vec::new(), programs_to_kill: Vec::new(), wait_seconds: 2 } } }
+struct Config { programs_to_launch: Vec<ProgramToLaunch>, programs_to_kill: Vec<String> }
+impl Default for Config { fn default() -> Self { Self { programs_to_launch: Vec::new(), programs_to_kill: Vec::new() } } }
 
 lazy_static! {
     static ref CONFIG: Mutex<Config> = Mutex::new(Config::default());
@@ -66,77 +66,73 @@ fn launch_process_by_name(name: &str) {
     let config = CONFIG.lock().unwrap();
     if let Some(program) = config.programs_to_launch.iter().find(|p| p.name == name) {
         launch_process(&program.path);
-    } else { log::log(LogLevel::Critical, "SYSTEM", &format!("Program with name '{}' not found for keybind/QA.", name)); }
+    } else { log::log(LogLevel::Critical, "SYSTEM", &format!("Program with name '{}' not found.", name)); }
 }
 
 // --- Quick Access & Icon Management ---
-fn create_placeholder_icon(path: &Path) {
-    image::RgbaImage::new(32, 32).save_with_format(path, image::ImageFormat::Png).ok();
-}
-
+fn create_placeholder_icon(path: &Path) { image::RgbaImage::new(32, 32).save_with_format(path, image::ImageFormat::Png).ok(); }
 fn extract_and_save_icon(exe_path: &str, save_path: &Path) -> Result<(), String> {
     let base64_str = get_icon_base64_by_path(exe_path).map_err(|e| e.to_string())?;
     let image_data = BASE64.decode(base64_str).map_err(|e| e.to_string())?;
     let img = image::load(Cursor::new(&image_data), image::ImageFormat::Png).map_err(|e| e.to_string())?;
     img.save(save_path).map_err(|e| e.to_string())
 }
-
 fn setup_quick_access_for_program(program: &ProgramToLaunch) {
     let addon_dir = match get_addon_dir(env!("CARGO_PKG_NAME")) { Some(dir) => dir, None => return };
     let icons_dir = addon_dir.join("icons");
     fs::create_dir_all(&icons_dir).ok();
     
     let icon_path = icons_dir.join(format!("{}.png", program.name));
-    if let Err(e) = extract_and_save_icon(&program.path, &icon_path) {
-        log::log(LogLevel::Warning, "SYSTEM", &format!("Could not extract icon for {}: {}. Using placeholder.", program.name, e));
-        create_placeholder_icon(&icon_path);
+    if !icon_path.exists() { // Only create the icon file if it doesn't already exist
+        if let Err(e) = extract_and_save_icon(&program.path, &icon_path) {
+            log::log(LogLevel::Warning, "SYSTEM", &format!("Could not extract icon for {}: {}. Using placeholder.", program.name, e));
+            create_placeholder_icon(&icon_path);
+        }
     }
 
     let qa_item_id = format!("QA_ITEM_{}", program.name);
     let qa_tex_id = format!("QA_TEX_{}", program.name);
-    let qa_kb_id = format!("QA_KB_{}", program.name);
+    let qa_kb_id = format!("LAUNCH_{}", program.name);
     
-    load_texture_from_file(&qa_tex_id, &icon_path, None);
+    // MODIFIED: Use the correct, idempotent function for loading textures.
+    get_texture_or_create_from_file(&qa_tex_id, &icon_path);
     ICON_CACHE.lock().unwrap().insert(program.name.clone(), icon_path);
     
     register_keybind_with_string(&qa_kb_id, keybind_callback, "").revert_on_unload();
-    
-    // MODIFIED: This now correctly links the keybind to the quick access item.
-    // This will show the assigned key in the tooltip, or `((null))` if it's unbound.
     add_quick_access(
-        &qa_item_id,
-        &qa_tex_id,
-        &qa_tex_id,
-        &qa_kb_id, // <-- Correctly linked
+        &qa_item_id, &qa_tex_id, &qa_tex_id, &qa_kb_id,
         &get_filename_from_path(&program.path).unwrap_or_default(),
     ).revert_on_unload();
 }
-
 fn teardown_quick_access_for_program(program: &ProgramToLaunch) {
     let qa_item_id = format!("QA_ITEM_{}", program.name);
-    let qa_kb_id = format!("QA_KB_{}", program.name);
+    let qa_kb_id = format!("LAUNCH_{}", program.name);
+
     remove_quick_access(&qa_item_id);
     unregister_keybind(&qa_kb_id);
+    
+    // MODIFIED: We no longer try to unload the texture, as there is no API for it.
+    // We only delete the temporary icon file.
     if let Some(path) = ICON_CACHE.lock().unwrap().remove(&program.name) {
         fs::remove_file(path).ok();
     }
 }
 
+// --- Core Logic ---
 extern "C-unwind" fn keybind_callback(identifier: *const c_char, is_release: bool) {
     if is_release || identifier.is_null() { return; }
     let result = panic::catch_unwind(|| {
         let identifier_cstr = unsafe { CStr::from_ptr(identifier) };
         if let Ok(id_str) = identifier_cstr.to_str() {
-            if let Some(name) = id_str.strip_prefix("LAUNCH_") {
-                launch_process_by_name(name);
-            } else if let Some(name) = id_str.strip_prefix("QA_KB_") {
+            if let Some(name) = id_str.strip_prefix("LAUNCH_")
+                .or_else(|| id_str.strip_prefix("LAUNCH_")) 
+            {
                 launch_process_by_name(name);
             }
         }
     });
     if result.is_err() { log::log(LogLevel::Critical, "SYSTEM", "Panic caught in keybind handler!"); }
 }
-
 fn get_config_path() -> PathBuf { get_addon_dir(env!("CARGO_PKG_NAME")).expect("Addon directory should exist").join("settings.ron") }
 fn load_config_from_file() {
     let path = get_config_path();
@@ -148,26 +144,28 @@ fn save_config_to_file() {
     if let Some(parent) = path.parent() { fs::create_dir_all(parent).ok(); }
     if let Ok(ser) = ron::to_string(&*CONFIG.lock().unwrap()) { fs::write(path, ser).ok(); }
 }
-
 fn load() {
     load_config_from_file();
     let config = CONFIG.lock().unwrap().clone();
     log::log(LogLevel::Info, "SYSTEM", "Loading Assisted Deployment and Departure...");
     for program in config.programs_to_launch.iter() {
-        setup_quick_access_for_program(program);
-        if program.trigger == LaunchTrigger::OnAddonLoad { launch_process(&program.path); }
-        else if program.trigger == LaunchTrigger::OnKeybind {
+        if program.trigger == LaunchTrigger::OnKeybind {
             register_keybind_with_string(format!("LAUNCH_{}", program.name), keybind_callback, "").revert_on_unload();
         }
+        setup_quick_access_for_program(program);
+        if program.trigger == LaunchTrigger::OnAddonLoad { launch_process(&program.path); }
     }
     register_render(RenderType::OptionsRender, render!(render_options)).revert_on_unload();
     register_render(RenderType::Render, render!(render_popup)).revert_on_unload();
 }
-
 fn unload() {
     save_config_to_file();
     let config = CONFIG.lock().unwrap().clone();
-    for program in config.programs_to_launch.iter() { teardown_quick_access_for_program(program); }
+    
+    for program in config.programs_to_launch.iter() {
+        teardown_quick_access_for_program(program);
+    }
+    
     let mut kill_list = config.programs_to_kill;
     for program in &config.programs_to_launch {
         if program.close_on_unload {
@@ -176,22 +174,18 @@ fn unload() {
             }
         }
     }
-    log::log(LogLevel::Info, "SYSTEM", &format!("Initial kill list: {:?}", kill_list));
+    
     if !kill_list.is_empty() {
-        if config.wait_seconds > 0 {
-            log::log(LogLevel::Info, "SYSTEM", &format!("Waiting {}s...", config.wait_seconds));
-            std::thread::sleep(std::time::Duration::from_secs(config.wait_seconds));
-        }
         cleanup_processes(&kill_list);
     }
     log::log(LogLevel::Info, "SYSTEM", "Unloaded.");
 }
-
 fn cleanup_processes(targets: &[String]) {
     let safe_targets: Vec<_> = targets.iter().filter(|n| !n.eq_ignore_ascii_case("Gw2-64.exe")).collect();
-    log::log(LogLevel::Info, "SYSTEM", &format!("SAFE kill list: {:?}", safe_targets));
     if safe_targets.is_empty() { return; }
-    let mut sys = SYSTEM_INFO.lock().unwrap();
+    
+    log::log(LogLevel::Info, "SYSTEM", &format!("Closing processes: {:?}", safe_targets));
+    let mut sys = System::new_all();
     sys.refresh_processes();
     for target in safe_targets {
         for p in sys.processes().values().filter(|p| p.name().eq_ignore_ascii_case(target)) {
@@ -206,7 +200,6 @@ fn render_popup(ui: &Ui) {
     let mut pending_launch = PENDING_LAUNCH_CONFIRMATION.lock().unwrap();
     let mut close_popup = false;
     let path_to_launch = pending_launch.clone();
-
     if let Some(path) = path_to_launch {
         let filename = get_filename_from_path(&path).unwrap_or_else(|| "program".to_string());
         let mut open = true;
@@ -224,7 +217,6 @@ fn render_popup(ui: &Ui) {
     }
     if close_popup { *pending_launch = None; }
 }
-
 fn render_options(ui: &Ui) {
     let mut config = CONFIG.lock().unwrap();
     let mut changed = false;
@@ -237,7 +229,6 @@ fn render_options(ui: &Ui) {
             ui.same_line();
             if ui.small_button(&format!("-##launch{}", i)) {
                 teardown_quick_access_for_program(prog);
-                if prog.trigger == LaunchTrigger::OnKeybind { unregister_keybind(&format!("LAUNCH_{}", prog.name)); }
                 to_remove_idx = Some(i); changed = true;
             }
             let original_trigger = prog.trigger.clone();
@@ -261,11 +252,7 @@ fn render_options(ui: &Ui) {
             InputText::new(ui, "##add_launch", &mut *launch_input).build();
             ui.same_line();
             if ui.button("Browse...") {
-                let file = FileDialog::new()
-                    .add_filter("Executable", &["exe"])
-                    .set_title("Select a program to launch")
-                    .pick_file();
-                if let Some(path) = file {
+                if let Some(path) = FileDialog::new().add_filter("Executable", &["exe"]).pick_file() {
                     *launch_input = path.to_string_lossy().to_string();
                 }
             }
@@ -307,16 +294,7 @@ fn render_options(ui: &Ui) {
             }
         });
     }
-    ui.separator();
-    ui.text("Wait time before cleanup (seconds):");
-    ui.same_line();
-    ui.set_next_item_width(40.0);
-    let mut wait_str = config.wait_seconds.to_string();
-    if InputText::new(ui, "##wait_time", &mut wait_str).chars_decimal(true).build() {
-        if let Ok(val) = wait_str.parse::<u64>() {
-            if config.wait_seconds != val { config.wait_seconds = val; changed = true; }
-        }
-    }
+
     if changed { drop(config); save_config_to_file(); }
 }
 
