@@ -1,1 +1,1 @@
-vibe coded hard by gpt 4.1
+powered by google gemini
