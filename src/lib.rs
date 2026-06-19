@@ -17,16 +17,23 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{c_char, CStr},
+    ffi::{c_char, CStr, CString},
     fs,
     io::Cursor,
+    io::Error,
     panic,
     path::PathBuf,
     process::Command,
+    ptr,
     sync::Mutex,
 };
 use sysinfo::System;
 use windows_icons::get_icon_base64_by_path;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(lp_lib_file_name: *const i8) -> *mut u8;
+}
 
 // --- Configuration & State Management ---
 fn default_true() -> bool {
@@ -116,7 +123,7 @@ impl From<LegacyProgramToLaunch> for ProgramToLaunch {
         };
 
         // Fix the name field - remove .exe and sanitize
-        let clean_name = if legacy.name.ends_with(".exe") || legacy.name.ends_with(".com") || legacy.name.ends_with(".bat") {
+        let clean_name = if legacy.name.ends_with(".exe") || legacy.name.ends_with(".com") || legacy.name.ends_with(".bat") || legacy.name.ends_with(".dll") {
             // Remove extension from name
             let without_ext = legacy.name.rsplit_once('.').map_or(legacy.name.as_str(), |(name, _)| name);
             sanitize_identifier(without_ext)
@@ -182,7 +189,8 @@ fn get_executable_and_args_from_command(
     
     let exe_end_index = command_lower.rfind(".exe").map(|i| i + 4)
         .or_else(|| command_lower.rfind(".com").map(|i| i + 4))
-        .or_else(|| command_lower.rfind(".bat").map(|i| i + 4));
+        .or_else(|| command_lower.rfind(".bat").map(|i| i + 4))
+        .or_else(|| command_lower.rfind(".dll").map(|i| i + 4));
 
     let (exe_path_str, args_str) = match exe_end_index {
         Some(index) if Path::new(&command_str[..index]).is_file() => {
@@ -250,18 +258,54 @@ fn force_launch_process(path: &str) {
         }
     };
 
-    if let Some((exe_path, _)) = get_executable_and_args_from_command(path) {
+    let executable_and_args = get_executable_and_args_from_command(path);
+    if let Some((ref exe_path, _)) = executable_and_args {
         if let Some(parent_dir) = Path::new(&exe_path).parent() {
             command.current_dir(parent_dir);
         }
     }
 
-    if let Err(e) = command.spawn() {
-        log::log(
-            LogLevel::Critical,
-            "SYSTEM",
-            &format!("Failed to launch process: {}", e),
-        );
+    let is_dll = match executable_and_args {
+        Some((ref exe_path, _)) => {
+            (&exe_path).ends_with(".dll")
+        },
+        None => {
+            false
+        }
+    };
+
+    if is_dll {
+        match command.get_program().to_str()
+            .ok_or("Invalid UTF-8 in path")
+            .and_then(|s| CString::new(s).map_err(|_| "Couldn't create CString")) {
+            Ok(cmd_path_cstr) => {
+                let dll_handle: *mut u8 = unsafe { LoadLibraryA(cmd_path_cstr.as_ptr()) };
+
+                if dll_handle == ptr::null_mut() {
+                    let os_error = Error::last_os_error();
+                    log::log(
+                        LogLevel::Critical,
+                        "SYSTEM",
+                        &format!("Failed to load library (DLL): {}", os_error),
+                    );
+                }
+            },
+            Err(e) => {
+                log::log(
+                    LogLevel::Critical,
+                    "SYSTEM",
+                    &format!("Failed to load library (DLL): {}", e),
+                );
+            }
+        }
+    } else {
+        if let Err(e) = command.spawn() {
+            log::log(
+                LogLevel::Critical,
+                "SYSTEM",
+                &format!("Failed to launch process: {}", e),
+            );
+        }
     }
 }
 fn launch_process(path: &str) {
@@ -785,7 +829,7 @@ fn render_programs_to_launch_section(ui: &Ui) {
             ui.same_line();
             if ui.button("Browse...") {
                 if let Some(path) = FileDialog::new()
-                    .add_filter("Executable", &["exe"])
+                    .add_filter("Executable", &["exe", "dll"])
                     .pick_file()
                 {
                     *launch_input = path.to_string_lossy().to_string();
